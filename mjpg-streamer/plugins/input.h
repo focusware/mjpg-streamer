@@ -54,6 +54,7 @@ typedef struct _input input;
 struct _input {
     char *plugin;
     void *handle;
+    void *context;
 
     input_parameter param; // this holds the command line arguments
 

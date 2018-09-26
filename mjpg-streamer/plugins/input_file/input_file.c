@@ -44,21 +44,37 @@ void *worker_thread(void *);
 void worker_cleanup(void *);
 void help(void);
 
-static int delay = 0;
-static char *folder = NULL;
-static char *filename = NULL;
-static int rm = 0;
-static int plugin_number;
-
-/* global variables for this plugin */
-static int fd, rc, wd, size;
-static struct inotify_event *ev;
+struct worker_context {
+    int delay;
+    char *folder;
+    char *filename;
+    int rm;
+    int plugin_number;
+    unsigned char first_run;
+    /* global variables for this plugin */
+    int fd;
+    int wd;
+    int size;
+    struct inotify_event *ev;
+};
 
 /*** plugin interface functions ***/
 int input_init(input_parameter *param, int id)
 {
     int i;
-    plugin_number = id;
+    /* Create and initialize the worker context */
+    struct worker_context* context = (struct worker_context *)malloc(sizeof(struct worker_context));
+    context->first_run = 1;
+    context->delay = 0;
+    context->folder = NULL;
+    context->filename = NULL;
+    context->rm = 0;
+    context->fd = -1;
+    context->wd = -1;
+    context->size = 0;
+    context->ev = NULL;
+    /* Remember the plugin number in the context */
+    context->plugin_number = id;
 
     param->argv[0] = INPUT_PLUGIN_NAME;
 
@@ -109,32 +125,32 @@ int input_init(input_parameter *param, int id)
         case 2:
         case 3:
             DBG("case 2,3\n");
-            delay = atoi(optarg);
+            context->delay = atoi(optarg);
             break;
 
             /* f, folder */
         case 4:
         case 5:
             DBG("case 4,5\n");
-            folder = malloc(strlen(optarg) + 2);
-            strcpy(folder, optarg);
+            context->folder = malloc(strlen(optarg) + 2);
+            strcpy(context->folder, optarg);
             if(optarg[strlen(optarg)-1] != '/')
-                strcat(folder, "/");
+                strcat(context->folder, "/");
             break;
 
             /* r, remove */
         case 6:
         case 7:
             DBG("case 6,7\n");
-            rm = 1;
+            context->rm = 1;
             break;
 
             /* n, name */
         case 8:
         case 9:
             DBG("case 8,9\n");
-            filename = malloc(strlen(optarg) + 2);
-            strcpy(filename, optarg);
+            context->filename = malloc(strlen(optarg) + 2);
+            strcpy(context->filename, optarg);
             break;
 
         default:
@@ -145,17 +161,18 @@ int input_init(input_parameter *param, int id)
     }
 
     pglobal = param->global;
+    pglobal->in[id].context = context;
 
     /* check for required parameters */
-    if(folder == NULL) {
+    if(context->folder == NULL) {
         IPRINT("ERROR: no folder specified\n");
         return 1;
     }
 
-    IPRINT("folder to watch...: %s\n", folder);
-    IPRINT("forced delay......: %i\n", delay);
-    IPRINT("delete file.......: %s\n", (rm) ? "yes, delete" : "no, do not delete");
-    IPRINT("filename must be..: %s\n", (filename == NULL) ? "-no filter for certain filename set-" : filename);
+    IPRINT("folder to watch...: %s\n", context->folder);
+    IPRINT("forced delay......: %i\n", context->delay);
+    IPRINT("delete file.......: %s\n", (context->rm) ? "yes, delete" : "no, do not delete");
+    IPRINT("filename must be..: %s\n", (context->filename == NULL) ? "-no filter for certain filename set-" : context->filename);
 
     return 0;
 }
@@ -170,28 +187,29 @@ int input_stop(int id)
 
 int input_run(int id)
 {
+    struct worker_context* context = pglobal->in[id].context;
     pglobal->in[id].buf = NULL;
 
-    rc = fd = inotify_init();
+    int rc = context->fd = inotify_init();
     if(rc == -1) {
         perror("could not initilialize inotify");
         return 1;
     }
 
-    rc = wd = inotify_add_watch(fd, folder, IN_CLOSE_WRITE | IN_MOVED_TO | IN_ONLYDIR);
+    rc = context->wd = inotify_add_watch(context->fd, context->folder, IN_CLOSE_WRITE | IN_MOVED_TO | IN_ONLYDIR);
     if(rc == -1) {
         perror("could not add watch");
         return 1;
     }
 
-    size = sizeof(struct inotify_event) + (1 << 16);
-    ev = malloc(size);
-    if(ev == NULL) {
+    context->size = sizeof(struct inotify_event) + (1 << 16);
+    context->ev = malloc(context->size);
+    if(context->ev == NULL) {
         perror("not enough memory");
         return 1;
     }
 
-    if(pthread_create(&worker, 0, worker_thread, NULL) != 0) {
+    if(pthread_create(&worker, 0, worker_thread, context) != 0) {
         free(pglobal->in[id].buf);
         fprintf(stderr, "could not start worker thread\n");
         exit(EXIT_FAILURE);
@@ -223,35 +241,36 @@ void *worker_thread(void *arg)
     int file;
     size_t filesize = 0;
     struct stat stats;
+    struct worker_context* context = (struct worker_context *)arg;
 
     /* set cleanup handler to cleanup allocated ressources */
-    pthread_cleanup_push(worker_cleanup, NULL);
+    pthread_cleanup_push(worker_cleanup, arg);
 
     while(!pglobal->stop) {
 
         /* wait for new frame, read will block until something happens */
-        rc = read(fd, ev, size);
+        int rc = read(context->fd, context->ev, context->size);
         if(rc == -1) {
             perror("reading inotify events failed");
             break;
         }
 
         /* sanity check */
-        if(wd != ev->wd) {
-            fprintf(stderr, "This event is not for the watched directory (%d != %d)\n", wd, ev->wd);
+        if(context->wd != context->ev->wd) {
+            fprintf(stderr, "This event is not for the watched directory (%d != %d)\n", context->wd, context->ev->wd);
             continue;
         }
 
-        if(ev->mask & (IN_IGNORED | IN_Q_OVERFLOW | IN_UNMOUNT)) {
+        if(context->ev->mask & (IN_IGNORED | IN_Q_OVERFLOW | IN_UNMOUNT)) {
             fprintf(stderr, "event mask suggests to stop\n");
             break;
         }
 
         /* prepare filename */
-        snprintf(buffer, sizeof(buffer), "%s%s", folder, ev->name);
+        snprintf(buffer, sizeof(buffer), "%s%s", context->folder, context->ev->name);
 
         /* check if the filename matches specified parameter (if given) */
-        if((filename != NULL) && (strcmp(filename, ev->name) != 0)) {
+        if((context->filename != NULL) && (strcmp(context->filename, context->ev->name) != 0)) {
             DBG("ignoring this change (specified filename does not match)\n");
             continue;
         }
@@ -275,6 +294,7 @@ void *worker_thread(void *arg)
         filesize = stats.st_size;
 
         /* copy frame from file to global buffer */
+        int plugin_number = context->plugin_number;
         pthread_mutex_lock(&pglobal->in[plugin_number].db);
 
         /* allocate memory for frame */
@@ -302,14 +322,14 @@ void *worker_thread(void *arg)
         close(file);
 
         /* delete file if necessary */
-        if(rm) {
+        if(context->rm) {
             rc = unlink(buffer);
             if(rc == -1) {
                 perror("could not remove/delete file");
             }
         }
 
-        if(delay != 0) usleep(1000 * delay);
+        if(context->delay != 0) usleep(1000 * context->delay);
     }
 
     DBG("leaving input thread, calling cleanup function now\n");
@@ -321,26 +341,27 @@ void *worker_thread(void *arg)
 
 void worker_cleanup(void *arg)
 {
-    static unsigned char first_run = 1;
+    struct worker_context* context = (struct worker_context *)arg;
+    int plugin_number = context->plugin_number;
 
-    if(!first_run) {
-        DBG("already cleaned up ressources\n");
+    if(!context->first_run) {
+        DBG("already cleaned up resources\n");
         return;
     }
 
-    first_run = 0;
-    DBG("cleaning up ressources allocated by input thread\n");
+    context->first_run = 0;
+    DBG("cleaning up resources allocated by input thread\n");
 
     if(pglobal->in[plugin_number].buf != NULL) free(pglobal->in[plugin_number].buf);
 
-    free(ev);
+    free(context->ev);
 
-    rc = inotify_rm_watch(fd, wd);
+    int rc = inotify_rm_watch(context->fd, context->wd);
     if(rc == -1) {
         perror("could not close watch descriptor");
     }
 
-    rc = close(fd);
+    rc = close(context->fd);
     if(rc == -1) {
         perror("could not close filedescriptor");
     }
