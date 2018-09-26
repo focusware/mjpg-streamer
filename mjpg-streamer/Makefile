@@ -32,10 +32,10 @@ LFLAGS += -lpthread -ldl
 APP_BINARY = mjpg_streamer
 
 # define the names and targets of the plugins
-PLUGINS = input_uvc.so
-PLUGINS += output_file.so
-PLUGINS += output_udp.so
-PLUGINS += output_http.so
+#PLUGINS = input_uvc.so
+#PLUGINS += output_file.so
+#PLUGINS += output_udp.so
+PLUGINS = output_http.so
 PLUGINS += input_testpicture.so
 #PLUGINS += output_autofocus.so
 #PLUGINS += input_gspcav1.so
